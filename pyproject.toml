@@ -16,6 +16,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
+    "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3 :: Only",
@@ -27,8 +28,9 @@ classifiers = [
 ]
 
 [project.urls]
+Source = "https://github.com/dlech/backports-asyncio-guest"
+Issues = "https://github.com/dlech/backports-asyncio-guest/issues"
 "Upstream proposal" = "https://github.com/python/cpython/pull/145343"
-# Source and Issues: add once the repository is hosted.
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/backports"]

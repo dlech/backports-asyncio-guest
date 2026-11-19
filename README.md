@@ -73,10 +73,11 @@ in each app. The package uses:
   one thread and process them on the other;
 - `asyncio.events._get_running_loop()`/`_set_running_loop()`.
 
-The CI workflow tests it on each supported Python version and on CPython's
-development branch, on Windows (x64 and ARM64), Linux and macOS. macOS and
-free-threaded builds (3.13t, 3.14t) haven't been tested yet: the classifiers
-claim Windows and Linux only, until CI passes there.
+The CI workflow tests the built wheel on each supported Python version, on
+Linux, Windows (x64 and ARM64) and macOS, every week as well as on each push.
+Two experimental jobs also run: CPython's development branch, and the
+free-threaded 3.14t build, on Linux and Windows. Free-threaded builds pass
+there, but aren't claimed as supported yet.
 
 ## Running the tests
 
@@ -97,8 +98,7 @@ Only once CPython has merged guest mode:
    `backports.asyncio.guest.start_guest_run` *is* `asyncio.start_guest_run`.
 2. Set `requires-python`'s and the CI matrix's lower bound to the oldest
    supported version, and the `version` in `pyproject.toml`.
-3. Add the repository's Source and Issues links to `[project.urls]`.
-4. CI must pass on every job, including macOS.
+3. CI must pass on every job.
 
 ## License
 
