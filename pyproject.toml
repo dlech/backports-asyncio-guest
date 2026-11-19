@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "backports-asyncio-guest"
+version = "0.1.0.dev0"
+description = "Backport of asyncio.start_guest_run(): run asyncio as a guest of another event loop"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "PSF-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "David Lechner" }]
+keywords = ["asyncio", "guest mode", "event loop", "gui"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+
+[project.urls]
+"Upstream proposal" = "https://github.com/python/cpython/pull/145343"
+# Source and Issues: add once the repository is hosted.
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backports"]
