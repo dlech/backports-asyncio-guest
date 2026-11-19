@@ -1,8 +1,22 @@
 name: test
 
 on:
+  # Only for changes that can affect the tests: not the README, say.
   push:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'LICENSE'
+      - '.github/workflows/test.yml'
   pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'LICENSE'
+      - '.github/workflows/test.yml'
+  workflow_dispatch:
   schedule:
     # Weekly: the package relies on asyncio's private parts, so catch changes
     # in new Python releases and CPython's development branch.
