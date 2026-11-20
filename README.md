@@ -41,11 +41,20 @@ task = start_guest_run(
 )
 ```
 
-- `run_sync_soon_threadsafe(fn)` must be thread-safe, must not block, and must
-  not raise. For example:
+- `run_sync_soon_threadsafe(fn)` must be thread-safe and must not raise. It
+  must return before `fn` runs, even when called on the host thread, and must
+  never wait for `fn` to run, which can deadlock. It's called both on the
+  host thread, where it must not wait for the host loop at all, and from the
+  I/O thread, where it may wait for the host loop to accept `fn`, but then
+  the run, and the interpreter's exit, hang if the host loop stops while it
+  waits. For example:
   - WinUI: `lambda fn: dispatcher_queue.try_enqueue(fn)`;
   - Tk: append `fn` to a queue, then `root.call('after', 'idle', name)`;
-  - Qt: post to an object on the GUI thread with a queued signal.
+  - Qt: use a queued connection, not a direct, automatic or blocking one.
+
+  If it raises when `start_guest_run()` first calls it, without having run
+  `fn`, the run is cleaned up (the main task, and any other task `async_fn`
+  created, cancelled, and the loop closed) and the exception propagates.
 - `done_callback(task)` runs on the host thread after the run has finished:
   remaining tasks cancelled, async generators and the default executor shut
   down, and the loop closed.
