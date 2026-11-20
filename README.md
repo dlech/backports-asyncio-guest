@@ -25,9 +25,12 @@ the host only has to provide a thread-safe "run this soon" function.
   due, it asks the host to run the next batch.
 - One token passes between the two threads, so the loop is never touched by
   both at once.
-- Modal loops entered by the host, such as a window being dragged or a
-  `MessageBox`, keep asyncio running, because they keep running the host's
-  queue.
+- A modal loop, such as a window being dragged or a `MessageBox`, keeps
+  asyncio running when host code enters it, because it keeps running the
+  host's queue. Guest code must not enter one: the batch that entered it is
+  still running, so the run makes no progress until it returns, and the modal
+  loop may run what the run already posted to the host re-entrantly. See
+  [Modal dialogs](#modal-dialogs).
 
 ## Usage
 
@@ -74,6 +77,32 @@ task = start_guest_run(
 The loop is asyncio's own `SelectorEventLoop`, or on Windows its
 `ProactorEventLoop`, via private subclasses. Event loop policies are not
 consulted, so it can't run uvloop.
+
+### Modal dialogs
+
+A coroutine, or any other guest code, must not show a modal dialog directly:
+asyncio makes no progress until the dialog closes. Instead, have the host
+show it, and await the answer:
+
+```python
+async def on_host(show_dialog):
+    """Run show_dialog() as host code, and return what it returns."""
+    loop = asyncio.get_running_loop()
+    answer = loop.create_future()
+
+    def resolve(result):
+        if not answer.done():  # the awaiting task may have been cancelled
+            answer.set_result(result)
+
+    def show():
+        loop.call_soon_threadsafe(resolve, show_dialog())
+
+    host_post(show)  # the run_sync_soon_threadsafe function
+    return await answer
+```
+
+For example, `await on_host(lambda: messagebox.askyesno('Quit', 'Sure?'))`
+with tkinter. Guest batches keep running while the dialog is open.
 
 ### tkinter
 

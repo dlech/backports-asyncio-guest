@@ -209,6 +209,14 @@ def start_guest_run(async_fn, *args,
     loop's other methods, such as call_soon() and create_task(), are for
     guest code.
 
+    A modal loop entered by host code keeps the run going, as long as it
+    runs the host's queue.  Guest code must not enter one: the batch that
+    entered it is still running, so the run makes no progress until it
+    returns, and if the modal loop runs the host's queue, it may run
+    callables the run already posted re-entrantly.  To show a modal
+    dialog from guest code, post it to the host with
+    run_sync_soon_threadsafe and await its answer.
+
     Signal handling stays with the host: the guest loop never touches
     signal.set_wakeup_fd(), and loop.add_signal_handler() raises
     RuntimeError.  The host may forward signals into the loop with
