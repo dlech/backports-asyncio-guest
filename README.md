@@ -61,6 +61,12 @@ task = start_guest_run(
 - Between batches, host code (a button handler, say) schedules guest work with
   `loop.call_soon_threadsafe()`, as it would from any other thread. To cancel
   the run from the host, use `loop.call_soon_threadsafe(task.cancel)`.
+- That goes for everything host code asks of the guest, although it runs on
+  the loop's thread: create a task with
+  `loop.call_soon_threadsafe(loop.create_task, coro)`, say, and complete a
+  future with `loop.call_soon_threadsafe(fut.set_result, value)`. The loop's
+  other methods, such as `call_soon()` and `create_task()`, are for guest
+  code.
 - Signal handling stays with the host: `loop.add_signal_handler()` raises
   `RuntimeError`.
 

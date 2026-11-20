@@ -203,6 +203,12 @@ def start_guest_run(async_fn, *args,
     running in the first callback passed to run_sync_soon_threadsafe,
     after start_guest_run() has returned.
 
+    Host code that runs between guest batches, such as an event
+    handler, schedules guest work with loop.call_soon_threadsafe(), as
+    from any other thread, although it runs on the loop's thread.  The
+    loop's other methods, such as call_soon() and create_task(), are for
+    guest code.
+
     Signal handling stays with the host: the guest loop never touches
     signal.set_wakeup_fd(), and loop.add_signal_handler() raises
     RuntimeError.  The host may forward signals into the loop with
