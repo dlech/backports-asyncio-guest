@@ -49,7 +49,8 @@ task = start_guest_run(
   the run, and the interpreter's exit, hang if the host loop stops while it
   waits. For example:
   - WinUI: `lambda fn: dispatcher_queue.try_enqueue(fn)`;
-  - Tk: append `fn` to a queue, then `root.call('after', 'idle', name)`;
+  - Tk: see [tkinter](#tkinter), where every call from another thread waits
+    for Tk's main loop;
   - Qt: use a queued connection, not a direct, automatic or blocking one.
 
   If it raises when `start_guest_run()` first calls it, without having run
@@ -73,6 +74,98 @@ task = start_guest_run(
 The loop is asyncio's own `SelectorEventLoop`, or on Windows its
 `ProactorEventLoop`, via private subclasses. Event loop policies are not
 consulted, so it can't run uvloop.
+
+### tkinter
+
+Every tkinter call made from another thread waits for Tk's main loop. This
+recipe posts with Tk's `after idle`, through `root.tk.call()`, which waits
+too:
+
+```python
+import asyncio
+import collections
+import tkinter as tk
+
+from backports.asyncio.guest import start_guest_run
+
+root = tk.Tk()
+label = tk.Label(root, text='0', width=20)
+label.pack()
+
+
+async def main():
+    for n in range(1, 1000):
+        await asyncio.sleep(1)
+        label['text'] = str(n)
+
+
+posted = collections.deque()
+
+
+def run_posted():
+    # One 'after idle' per post, so each event runs exactly one function,
+    # and Tk gets to paint between a busy guest's batches.
+    posted.popleft()()
+
+
+run_posted_name = root.register(run_posted)
+
+
+def host_post(fn):
+    posted.append(fn)
+    root.tk.call('after', 'idle', run_posted_name)
+
+
+def on_close():
+    # Not root.destroy(): the run needs Tk's main loop until done_callback.
+    # (If the run is abandoned after a failure, done_callback never comes,
+    # so mainloop() never returns, and the process keeps running with no
+    # window.)
+    root.withdraw()
+    task.get_loop().call_soon_threadsafe(task.cancel)
+
+
+def on_done(task):
+    root.destroy()
+
+
+root.protocol('WM_DELETE_WINDOW', on_close)
+task = start_guest_run(
+    main, run_sync_soon_threadsafe=host_post, done_callback=on_done)
+root.mainloop()
+```
+
+What to know about it:
+
+- `root.tk.call()` is thread-safe with a threaded Tcl, the default. But called
+  from another thread, it raises `RuntimeError` if the thread that created the
+  root isn't in `mainloop()` within about a second, and that abandons the
+  run. So run `root.mainloop()`, not `update()` in a loop, until
+  `done_callback`.
+- From another thread, `root.tk.call()` doesn't return until Tk's main loop
+  has run the `after idle` command, though not `fn` itself. So the host
+  function blocks the I/O thread while the main thread is busy: asyncio's I/O
+  waits for Tk.
+- If the root is destroyed while such a call is waiting, the I/O thread waits
+  forever, and because it isn't a daemon thread, the interpreter never exits.
+  On the main thread, the call raises `TclError` after the root is destroyed.
+  So never destroy the root before `done_callback` runs. On close, withdraw the
+  window and cancel the run, and destroy the root in `done_callback`.
+- `after idle`, not `after 0`: Tk redraws widgets in idle handlers, which run
+  only when no other events are pending. So a busy guest posting its next
+  batch with `after 0` would starve them, while `after idle` takes turns with
+  them. Loop code must not call `update()` or `update_idletasks()`: they
+  could run a function the run has already posted while the batch is still
+  running.
+
+On Unix, `root.tk.createfilehandler()` avoids blocking: the host function
+appends `fn` to the deque and sends a byte, without blocking, to one end of a
+`socket.socketpair()`. The file handler on the other end reads the bytes and
+posts the deque's runner with `after idle`, rather than running it: a busy
+guest keeps the socket readable, so running the deque directly would starve
+redraws, as `after 0` would. On Windows, tkinter has nothing that both
+avoids blocking and is event-driven, so `after idle` from the I/O thread
+stays the way to post there, with the root destroyed only in `done_callback`.
 
 ## Private parts it relies on
 
