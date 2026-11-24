@@ -217,7 +217,15 @@ def start_guest_run(async_fn, *args,
     handler, schedules guest work with loop.call_soon_threadsafe(), as
     from any other thread, although it runs on the loop's thread.  The
     loop's other methods, such as call_soon() and create_task(), are for
-    guest code.
+    guest code: from host code, nothing wakes the loop for the work they
+    schedule.  In debug mode, call_soon(), call_later(), call_at() and
+    create_task() raise RuntimeError when host code calls them between
+    batches.  With an eager task factory, create_task() runs the
+    coroutine's first step at once instead, which this doesn't catch,
+    though from Python 3.14 asyncio raises its own RuntimeError.
+    asyncio.create_task() is unchanged: the guest loop isn't the running
+    loop there, so it raises RuntimeError, or with an asyncio host,
+    creates the task on the host's loop.
 
     A modal loop entered by host code keeps the run going, as long as it
     runs the host's queue.  Guest code must not enter one: the batch that
@@ -266,12 +274,14 @@ def start_guest_run(async_fn, *args,
         # must follow in a 'finally' clause, even if this is interrupted.
         _hide_host_task(host)
         _set_thread_state(guest_state)
+        loop._guest_code_running = True
 
     def _leave_guest(host):
         # Keep changes made by guest callbacks, e.g. by loop.set_debug().
         # If entering was interrupted, what is kept may be the host's
         # state, but then the batch raises, and the run is abandoned.
         nonlocal guest_state
+        loop._guest_code_running = False
         guest_state = _get_thread_state()
         _restore_host(*host)
 
@@ -285,6 +295,9 @@ def start_guest_run(async_fn, *args,
             _enter_guest(host)
             loop._run_forever_cleanup()
         finally:
+            # Not _leave_guest(): the loop's guest code runs to the end of
+            # the final cleanup, so _guest_code_running stays set, and a
+            # guest run this loop hosts may still call it.
             _restore_host(*host)
 
     def _join_backend():
@@ -395,6 +408,7 @@ def start_guest_run(async_fn, *args,
             if host[1] is not None:
                 tasks._swap_current_task(host_loop, None)
             _set_thread_state(guest_state)
+            loop._guest_code_running = True
             loop.process_events(event_list)
             event_list = None
             loop.process_ready()
@@ -547,11 +561,15 @@ def start_guest_run(async_fn, *args,
         with _host_loop_hidden():
             loop._run_forever_setup()
             guest_state = _get_thread_state()
-            # With an eager task factory, the main task's first step runs
-            # here.  If that finishes the task, adding the done callback
-            # schedules it with call_soon().
-            main_task = loop.create_task(async_fn(*args))
-            main_task.add_done_callback(_on_task_done)
+            # Guest code runs here: async_fn(*args), and with an eager task
+            # factory, the main task's first step.  If that finishes the
+            # task, adding the done callback schedules it with call_soon().
+            loop._guest_code_running = True
+            try:
+                main_task = loop.create_task(async_fn(*args))
+                main_task.add_done_callback(_on_task_done)
+            finally:
+                loop._guest_code_running = False
             # Again: async_fn(*args) may have changed it.
             guest_state = _get_thread_state()
 

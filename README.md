@@ -70,7 +70,29 @@ task = start_guest_run(
   `loop.call_soon_threadsafe(loop.create_task, coro)`, say, and complete a
   future with `loop.call_soon_threadsafe(fut.set_result, value)`. The loop's
   other methods, such as `call_soon()` and `create_task()`, are for guest
-  code.
+  code: from host code, they don't wake the loop, so the work may wait
+  indefinitely. `asyncio.create_task()` from host code raises
+  `RuntimeError`, as no loop is running, or with an asyncio host, creates the
+  task on the host's loop.
+- In asyncio debug mode (`loop.get_debug()`, or `python -X dev`), this
+  package's loop raises `RuntimeError` when host code calls `call_soon()`,
+  `call_later()`, `call_at()` or `create_task()` between batches, as asyncio
+  does for calls from another thread. (Where `asyncio.start_guest_run()` comes
+  from the standard library, that depends on its implementation.) Like
+  asyncio's own check, it reports the mistake rather than repair it, so the
+  operation may be left half done: `fut.set_result()` from host code marks the
+  future done before `call_soon()` raises, so its awaiter never wakes, and an
+  unclosed `StreamWriter` collected between batches reports "Exception
+  ignored" and leaves its connection half closed. Likewise
+  `loop.create_task()` from host code raises once the task is made, which
+  leaves it pending, so "Task was destroyed but it is pending!" is logged too.
+  The check can't see calls that don't schedule through those methods, such as
+  `loop.stop()`, `handle.cancel()`, `fut.add_done_callback()` on a pending
+  future, and on POSIX `add_reader()` and `remove_reader()`. With an eager
+  task factory, `loop.create_task()` runs the coroutine's first step at once,
+  which the check doesn't catch on Python 3.12 and 3.13, while from 3.14
+  asyncio raises its own "is not the running loop" error. Host code still uses
+  `call_soon_threadsafe()` for all of them.
 - Signal handling stays with the host: `loop.add_signal_handler()` raises
   `RuntimeError`.
 
@@ -204,6 +226,8 @@ in each app. The package uses:
 
 - `BaseEventLoop._run_once()`'s internals (`_ready`, `_scheduled`, handles'
   `_run()`, and so on), to run it as separate steps;
+- `BaseEventLoop._check_thread()`, which debug mode calls, extended to
+  catch host code calling between batches;
 - `_run_forever_setup()`/`_run_forever_cleanup()` on Python 3.13 and later,
   with a copy for 3.11 and 3.12;
 - on Windows, `IocpProactor`'s completion cache, to wait for completions on
@@ -222,8 +246,9 @@ there, but aren't claimed as supported yet.
 python -X dev -m unittest discover -s tests
 ```
 
-with the package installed, or with `PYTHONPATH=src`. The tests use the
-backport's own `start_guest_run()`, even on a Python that has one.
+with the package installed, or with `PYTHONPATH=src`, and again without
+`-X dev`, which turns on asyncio's debug mode. The tests use the backport's
+own `start_guest_run()`, even on a Python that has one.
 
 ## Releasing
 

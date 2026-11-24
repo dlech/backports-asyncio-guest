@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import unittest
+from functools import partial
 from unittest import mock
 
 # The backport's own function, even on a Python that has guest mode, so its
@@ -97,6 +98,50 @@ class GuestTestCase(unittest.TestCase):
         )
         return host.run(timeout=timeout)
 
+    def _check_unstarted_run_unwound(self, run_sync_soon_threadsafe,
+                                     exc_type):
+        # The run fails to start: the exception propagates, and the run
+        # leaves nothing behind.  Neither the main task's coroutine nor
+        # one of a task created with it has run, both are closed, no task
+        # is left pending, and the loop is closed.
+        started = []
+
+        async def side():
+            started.append('side')
+
+        async def main():
+            started.append('main')
+
+        coros = []
+
+        def async_fn():
+            coros.append(side())
+            asyncio.get_running_loop().create_task(coros[-1])
+            coros.append(main())
+            return coros[-1]
+
+        loops = []
+        new_guest_loop = _loops.new_guest_loop
+
+        def capture_loop():
+            loops.append(new_guest_loop())
+            return loops[-1]
+
+        with self.assertNoLogs('asyncio', level='ERROR'):
+            with mock.patch.object(_loops, 'new_guest_loop', capture_loop):
+                with self.assertRaises(exc_type):
+                    start_guest_run(
+                        async_fn,
+                        run_sync_soon_threadsafe=run_sync_soon_threadsafe,
+                        done_callback=lambda task: self.fail('done_callback'),
+                    )
+            gc.collect()
+        self.assertEqual(started, [])
+        for coro in coros:
+            self.assertIsNone(coro.cr_frame)  # closed
+        [loop] = loops
+        self.assertTrue(loop.is_closed())
+
 
 class TestGuestRun(GuestTestCase):
     """Test asyncio.start_guest_run with a mock host loop."""
@@ -172,50 +217,6 @@ class TestGuestRun(GuestTestCase):
         )
         host.run(timeout=5)
         self.assertTrue(task.cancelled())
-
-    def _check_unstarted_run_unwound(self, run_sync_soon_threadsafe,
-                                     exc_type):
-        # The run fails to start: the exception propagates, and the run
-        # leaves nothing behind.  Neither the main task's coroutine nor
-        # one of a task created with it has run, both are closed, no task
-        # is left pending, and the loop is closed.
-        started = []
-
-        async def side():
-            started.append('side')
-
-        async def main():
-            started.append('main')
-
-        coros = []
-
-        def async_fn():
-            coros.append(side())
-            asyncio.get_running_loop().create_task(coros[-1])
-            coros.append(main())
-            return coros[-1]
-
-        loops = []
-        new_guest_loop = _loops.new_guest_loop
-
-        def capture_loop():
-            loops.append(new_guest_loop())
-            return loops[-1]
-
-        with self.assertNoLogs('asyncio', level='ERROR'):
-            with mock.patch.object(_loops, 'new_guest_loop', capture_loop):
-                with self.assertRaises(exc_type):
-                    start_guest_run(
-                        async_fn,
-                        run_sync_soon_threadsafe=run_sync_soon_threadsafe,
-                        done_callback=lambda task: self.fail('done_callback'),
-                    )
-            gc.collect()
-        self.assertEqual(started, [])
-        for coro in coros:
-            self.assertIsNone(coro.cr_frame)  # closed
-        [loop] = loops
-        self.assertTrue(loop.is_closed())
 
     def test_host_function_raises_at_start(self):
         class HostGone(Exception):
@@ -817,11 +818,15 @@ class TestGuestRun(GuestTestCase):
             return depth
 
         old_depth = sys.get_coroutine_origin_tracking_depth()
-        start_guest_run(
-            coro,
-            run_sync_soon_threadsafe=host.run_sync_soon_threadsafe,
-            done_callback=host.done_callback,
-        )
+        # Not in debug mode at first, whatever -X dev says: the batches
+        # after set_debug(True) see its effect only if the guest's state
+        # is kept from batch to batch.
+        with debug_mode(False):
+            start_guest_run(
+                coro,
+                run_sync_soon_threadsafe=host.run_sync_soon_threadsafe,
+                done_callback=host.done_callback,
+            )
         task = host.run()
         self.assertGreater(task.result(), 0)
         self.assertEqual(host_depths, [old_depth])
@@ -994,6 +999,807 @@ class TestGuestRun(GuestTestCase):
 
         task = self._run_guest(coro)
         self.assertTrue(task.get_loop().is_closed())
+
+
+def debug_mode(enabled):
+    """Create event loops in asyncio debug mode, or not, whatever -X dev
+    says, as loop.get_debug() reports it."""
+    return mock.patch.object(asyncio.coroutines, '_is_debug_mode',
+                             lambda: enabled)
+
+
+async def _call(fn):
+    fn()
+
+
+def _create_task(loop, fn):
+    coro = _call(fn)
+    try:
+        return loop.create_task(coro)
+    except BaseException:
+        coro.close()
+        raise
+
+
+# The guest loop's non-thread-safe methods that schedule work: called from
+# host code between batches, nothing wakes the I/O thread for that work.
+HOST_CALLS = {
+    'call_soon': lambda loop, fn: loop.call_soon(fn),
+    'call_later': lambda loop, fn: loop.call_later(0, fn),
+    'call_at': lambda loop, fn: loop.call_at(loop.time(), fn),
+    'create_task': _create_task,
+}
+
+
+class TestDebugHostCheck(GuestTestCase):
+    """In debug mode, host code that calls the guest loop's non-thread-safe
+    methods between batches gets RuntimeError."""
+
+    def _run_with_host_code(self, host_code, *, debug):
+        # Runs host_code(loop, task) once, between batches, while the main
+        # task waits for nothing else.  host_code must cancel the task.
+        host = MockHost()
+        ran = []
+
+        def run_host_code():
+            self.assertIsNone(asyncio._get_running_loop())
+            host_code(task.get_loop(), task)
+            ran.append(True)
+
+        async def coro():
+            self.assertEqual(asyncio.get_running_loop().get_debug(), debug)
+            host.run_sync_soon_threadsafe(run_host_code)
+            await asyncio.sleep(3600)
+
+        with debug_mode(debug):
+            task = start_guest_run(
+                coro,
+                run_sync_soon_threadsafe=host.run_sync_soon_threadsafe,
+                done_callback=host.done_callback,
+            )
+        self.assertIs(host.run(timeout=5), task)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(ran, [True])
+
+    def test_host_calls_raise(self):
+        for name, call in HOST_CALLS.items():
+            with self.subTest(name):
+                ran = []
+
+                def host_code(loop, task):
+                    with self.assertRaisesRegex(
+                            RuntimeError,
+                            r'from host code.*call_soon_threadsafe\(\)'):
+                        call(loop, lambda: ran.append(True))
+                    loop.call_soon_threadsafe(task.cancel)
+
+                if name == 'create_task':
+                    # The task is made before its first step's call_soon()
+                    # raises, and is left pending.
+                    logs = self.assertLogs('asyncio', level='ERROR')
+                else:
+                    logs = self.assertNoLogs('asyncio', level='ERROR')
+                with logs as cm:
+                    self._run_with_host_code(host_code, debug=True)
+                    gc.collect()
+                if name == 'create_task':
+                    self.assertEqual(
+                        [record.getMessage().splitlines()[0]
+                         for record in cm.records],
+                        ['Task was destroyed but it is pending!'])
+                self.assertEqual(ran, [])
+
+    @unittest.skipUnless(hasattr(asyncio, 'eager_task_factory'),
+                         'requires asyncio.eager_task_factory')
+    def test_eager_main_task(self):
+        # With an eager task factory, the main task may finish inside
+        # start_guest_run(): the run adds its done callback as guest code,
+        # so the check doesn't fire.
+        async def finishes():
+            return 'done'
+
+        async def suspends():
+            await asyncio.sleep(0)
+            return 'done'
+
+        for debug in (False, True):
+            for main in (finishes, suspends):
+                with self.subTest(debug=debug, main=main.__name__):
+                    def async_fn():
+                        loop = asyncio.get_running_loop()
+                        loop.set_task_factory(asyncio.eager_task_factory)
+                        return main()
+
+                    with debug_mode(debug), \
+                         self.assertNoLogs('asyncio', level='ERROR'):
+                        task = self._run_guest(async_fn)
+                    self.assertEqual(task.result(), 'done')
+                    self.assertTrue(task.get_loop().is_closed())
+
+    @unittest.skipUnless(hasattr(asyncio, 'eager_task_factory'),
+                         'requires asyncio.eager_task_factory')
+    def test_eager_main_task_failure_at_start(self):
+        # The main task finished at start, which queued the run's done
+        # callback, and then the host function fails: the unwind runs the
+        # queued callback, which must not call the host function again.
+        class HostGone(Exception):
+            pass
+
+        posted = []
+
+        def run_sync_soon_threadsafe(fn):
+            posted.append(fn)
+            raise HostGone
+
+        async def side():
+            await asyncio.sleep(3600)
+
+        async def main():
+            return 'done'
+
+        tasks = []
+
+        def async_fn():
+            loop = asyncio.get_running_loop()
+            loop.set_task_factory(asyncio.eager_task_factory)
+            tasks.append(loop.create_task(side()))
+            return main()
+
+        for debug in (False, True):
+            with self.subTest(debug=debug):
+                posted.clear()
+                tasks.clear()
+                with debug_mode(debug), \
+                     self.assertNoLogs('asyncio', level='ERROR'), \
+                     self.assertRaises(HostGone):
+                    start_guest_run(
+                        async_fn,
+                        run_sync_soon_threadsafe=run_sync_soon_threadsafe,
+                        done_callback=lambda task: self.fail('done_callback'),
+                    )
+                self.assertEqual(len(posted), 1)
+                [side_task] = tasks
+                self.assertTrue(side_task.cancelled())
+                self.assertTrue(side_task.get_loop().is_closed())
+
+    def test_interrupt_hiding_host_at_start(self):
+        # A KeyboardInterrupt right after the host's current task is hidden,
+        # at start: the run unwinds, and the host's state and current task
+        # are restored.
+        hide_host_task = _guest._hide_host_task
+        interrupted = []
+
+        def interrupting_hide_host_task(host):
+            hide_host_task(host)
+            if not interrupted:
+                interrupted.append(asyncio.current_task())
+                raise KeyboardInterrupt
+
+        loops = []
+        new_guest_loop = _loops.new_guest_loop
+
+        def capture_loop():
+            loops.append(new_guest_loop())
+            return loops[-1]
+
+        async def guest():
+            await asyncio.sleep(3600)
+
+        async def main():
+            host_task = asyncio.current_task()
+            hooks = sys.get_asyncgen_hooks()
+            with debug_mode(True), \
+                 mock.patch.object(_loops, 'new_guest_loop', capture_loop), \
+                 mock.patch.object(_guest, '_hide_host_task',
+                                   interrupting_hide_host_task), \
+                 self.assertRaises(KeyboardInterrupt):
+                start_guest_run(
+                    guest,
+                    run_sync_soon_threadsafe=lambda fn: self.fail('posted'),
+                    done_callback=lambda task: self.fail('done_callback'),
+                )
+            self.assertIs(asyncio.current_task(), host_task)
+            self.assertEqual(sys.get_asyncgen_hooks(), hooks)
+            return asyncio.get_running_loop()
+
+        host_loop = asyncio.run(main())
+        if hasattr(asyncio.tasks, '_swap_current_task'):
+            # The host task was hidden when the interrupt came.
+            self.assertEqual(interrupted, [None])
+        [guest_loop] = loops
+        self.assertIsNot(guest_loop, host_loop)
+        self.assertTrue(guest_loop.is_closed())
+        self.assertIsNone(asyncio._get_running_loop())
+        asyncio.run(asyncio.sleep(0))
+
+    def _check_start_fails_before_main_task(self, exc_type, *,
+                                            setup_then=None, async_fn,
+                                            host_loop=None):
+        # The run fails before it has a main task: the exception propagates
+        # as it is, the loop is closed, and the host's state is intact.
+        loops = []
+        new_guest_loop = _loops.new_guest_loop
+
+        def capture_loop():
+            loop = new_guest_loop()
+            loops.append(loop)
+            if setup_then is not None:
+                setup = loop._run_forever_setup
+
+                def run_forever_setup():
+                    setup()
+                    setup_then()
+
+                loop._run_forever_setup = run_forever_setup
+            return loop
+
+        def firstiter(agen):
+            pass
+
+        def finalizer(agen):
+            pass
+
+        old_hooks = sys.get_asyncgen_hooks()
+        old_depth = sys.get_coroutine_origin_tracking_depth()
+        sys.set_asyncgen_hooks(firstiter=firstiter, finalizer=finalizer)
+        sys.set_coroutine_origin_tracking_depth(3)
+        try:
+            with debug_mode(True), \
+                 self.assertNoLogs('asyncio', level='ERROR'), \
+                 mock.patch.object(_loops, 'new_guest_loop', capture_loop), \
+                 self.assertRaises(exc_type) as cm:
+                start_guest_run(
+                    async_fn,
+                    run_sync_soon_threadsafe=lambda fn: self.fail('posted'),
+                    done_callback=lambda task: self.fail('done_callback'),
+                )
+            self.assertIs(type(cm.exception), exc_type)
+            self.assertIs(asyncio._get_running_loop(), host_loop)
+            self.assertEqual(sys.get_asyncgen_hooks(), (firstiter, finalizer))
+            self.assertEqual(sys.get_coroutine_origin_tracking_depth(), 3)
+        finally:
+            sys.set_asyncgen_hooks(*old_hooks)
+            sys.set_coroutine_origin_tracking_depth(old_depth)
+        [loop] = loops
+        self.assertFalse(loop.is_running())
+        self.assertTrue(loop.is_closed())
+
+    def test_async_fn_raises(self):
+        class Boom(Exception):
+            pass
+
+        def async_fn():
+            raise Boom
+
+        self._check_start_fails_before_main_task(Boom, async_fn=async_fn)
+
+    def test_async_fn_raises_under_asyncio_host(self):
+        class Boom(Exception):
+            pass
+
+        def async_fn():
+            raise Boom
+
+        async def main():
+            host_task = asyncio.current_task()
+            self._check_start_fails_before_main_task(
+                Boom, async_fn=async_fn,
+                host_loop=asyncio.get_running_loop())
+            self.assertIs(asyncio.current_task(), host_task)
+
+        # In a thread with a timeout: a broken unwind may hang.
+        errors = []
+
+        def run():
+            try:
+                asyncio.run(main())
+            except BaseException as exc:
+                errors.append(exc)
+
+        # A daemon, so a hung unwind fails this test without also keeping the
+        # process from exiting.
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(30)
+        self.assertFalse(thread.is_alive(), 'the unwind hangs')
+        if errors:
+            raise errors[0]
+
+    def test_interrupt_after_setup(self):
+        async def main():
+            pass
+
+        def interrupt():
+            raise KeyboardInterrupt
+
+        self._check_start_fails_before_main_task(
+            KeyboardInterrupt, setup_then=interrupt, async_fn=main)
+
+    def test_interrupt_later_at_start(self):
+        # An interrupt anywhere at start unwinds the run: here, when the
+        # I/O thread is made.
+        with mock.patch.object(threading, 'Thread',
+                               side_effect=KeyboardInterrupt):
+            self._check_unstarted_run_unwound(
+                lambda fn: self.fail('posted'), KeyboardInterrupt)
+
+    def test_guest_run_hosted_by_guest_run(self):
+        # A run whose host is another guest loop runs its batches, start
+        # and cleanup inside the other loop's batches.  Its guest code may
+        # call the other loop's methods, as from that loop's guest code.
+        async def outer_main():
+            outer = asyncio.get_running_loop()
+            reply = outer.create_future()
+            reply.add_done_callback(lambda fut: None)
+            calls = []
+
+            def async_fn():
+                outer.call_soon(calls.append, 'start')
+                return inner_main()
+
+            async def inner_main():
+                outer.call_soon(calls.append, 'batch')
+                await asyncio.sleep(0)
+                reply.set_result('inner')
+
+            def done_callback(task):
+                outer.call_soon(calls.append, 'done')
+                done.set_result(task)
+
+            done = outer.create_future()
+            start_guest_run(
+                async_fn,
+                run_sync_soon_threadsafe=outer.call_soon_threadsafe,
+                done_callback=done_callback,
+            )
+            inner_task = await done
+            await asyncio.sleep(0)
+            return inner_task.result(), await reply, calls
+
+        with debug_mode(True):
+            task = self._run_guest(outer_main)
+        self.assertEqual(task.result(),
+                         (None, 'inner', ['start', 'batch', 'done']))
+
+    def test_hosted_run_during_final_cleanup(self):
+        # A run hosted by another guest run may call the other loop while
+        # that loop's final cleanup runs: there, a task of the other loop,
+        # cancelled by the cleanup, cancels the hosted run and waits for
+        # it, and the hosted run's guest code calls the other loop.
+        log = []
+
+        async def outer_main():
+            outer = asyncio.get_running_loop()
+            self.assertTrue(outer.get_debug())
+            inner_done = outer.create_future()
+            started = outer.create_future()
+
+            async def inner_main():
+                outer.call_soon_threadsafe(
+                    started.set_result, asyncio.current_task())
+                try:
+                    await asyncio.sleep(3600)
+                finally:
+                    try:
+                        outer.call_soon(log.append, 'called')
+                    except RuntimeError as exc:
+                        log.append(exc)
+
+            start_guest_run(
+                inner_main,
+                run_sync_soon_threadsafe=outer.call_soon_threadsafe,
+                done_callback=inner_done.set_result,
+            )
+            inner_task = await started
+
+            async def background():
+                try:
+                    await asyncio.sleep(3600)
+                finally:
+                    inner_task.get_loop().call_soon_threadsafe(
+                        inner_task.cancel)
+                    await inner_done
+
+            outer.create_task(background())
+            await asyncio.sleep(0.01)
+            return 'done'
+
+        with debug_mode(True):
+            task = self._run_guest(outer_main)
+        self.assertEqual(task.result(), 'done')
+        self.assertEqual(log, ['called'])
+
+    @unittest.skipUnless(hasattr(asyncio, 'eager_task_factory'),
+                         'requires asyncio.eager_task_factory')
+    def test_eager_main_task_starts_hosted_run(self):
+        # The main task is eager, so its first step runs inside
+        # start_guest_run(), and starts a run hosted by its loop: that
+        # run's guest code may call the hosting loop there too.
+        log = []
+
+        async def outer_main():
+            outer = asyncio.get_running_loop()
+            inner_done = outer.create_future()
+
+            async def inner_main():
+                return 'inner'
+
+            def inner_fn():
+                outer.call_soon(log.append, 'called')
+                return inner_main()
+
+            start_guest_run(
+                inner_fn,
+                run_sync_soon_threadsafe=outer.call_soon_threadsafe,
+                done_callback=inner_done.set_result,
+            )
+            inner_task = await inner_done
+            await asyncio.sleep(0)
+            return inner_task.result()
+
+        def async_fn():
+            loop = asyncio.get_running_loop()
+            loop.set_task_factory(asyncio.eager_task_factory)
+            return outer_main()
+
+        with debug_mode(True):
+            task = self._run_guest(async_fn)
+        self.assertEqual(task.result(), 'inner')
+        self.assertEqual(log, ['called'])
+
+    def test_host_call_right_after_start(self):
+        # Host code that runs once start_guest_run() has returned, before
+        # the first batch, is between batches too.
+        host = MockHost()
+
+        async def coro():
+            await asyncio.sleep(3600)
+
+        with debug_mode(True):
+            task = start_guest_run(
+                coro,
+                run_sync_soon_threadsafe=host.run_sync_soon_threadsafe,
+                done_callback=host.done_callback,
+            )
+        loop = task.get_loop()
+        with self.assertRaisesRegex(RuntimeError, 'from host code'):
+            loop.call_soon(lambda: None)
+        loop.call_soon_threadsafe(task.cancel)
+        host.run(timeout=5)
+        self.assertTrue(task.cancelled())
+
+    def test_interrupt_adding_done_callback(self):
+        # An interrupt once the main task exists, at start, unwinds the run.
+        class InterruptingTask(asyncio.Task):
+            interrupted = False
+
+            def add_done_callback(self, *args, **kwargs):
+                if not InterruptingTask.interrupted:
+                    InterruptingTask.interrupted = True
+                    raise KeyboardInterrupt
+                return super().add_done_callback(*args, **kwargs)
+
+        coros = []
+
+        async def main():
+            pass
+
+        def async_fn():
+            loop = asyncio.get_running_loop()
+            loop.set_task_factory(
+                lambda loop, coro, **kwargs:
+                    InterruptingTask(coro, loop=loop, **kwargs))
+            coros.append(main())
+            return coros[-1]
+
+        loops = []
+        new_guest_loop = _loops.new_guest_loop
+
+        def capture_loop():
+            loops.append(new_guest_loop())
+            return loops[-1]
+
+        with mock.patch.object(_loops, 'new_guest_loop', capture_loop), \
+             self.assertRaises(KeyboardInterrupt):
+            start_guest_run(
+                async_fn,
+                run_sync_soon_threadsafe=lambda fn: self.fail('posted'),
+                done_callback=lambda task: self.fail('done_callback'),
+            )
+        self.assertTrue(InterruptingTask.interrupted)
+        [coro] = coros
+        self.assertIsNone(coro.cr_frame)  # closed
+        [loop] = loops
+        self.assertTrue(loop.is_closed())
+        self.assertIsNone(asyncio._get_running_loop())
+
+    @unittest.skipUnless(hasattr(signal, 'set_wakeup_fd'),
+                         'requires signal.set_wakeup_fd')
+    def test_wakeup_fd_restored_when_loop_creation_fails(self):
+        if threading.current_thread() is not threading.main_thread():
+            self.skipTest('requires the main thread')
+        rsock, wsock = socket.socketpair()
+        self.addCleanup(rsock.close)
+        self.addCleanup(wsock.close)
+        wsock.setblocking(False)
+        old_fd = signal.set_wakeup_fd(wsock.fileno())
+        self.addCleanup(signal.set_wakeup_fd, old_fd)
+
+        def failing_new_guest_loop():
+            # As a loop could, before it fails.
+            signal.set_wakeup_fd(-1)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(_loops, 'new_guest_loop',
+                               failing_new_guest_loop), \
+             self.assertRaises(KeyboardInterrupt):
+            start_guest_run(
+                asyncio.sleep, 0,
+                run_sync_soon_threadsafe=lambda fn: self.fail('posted'),
+                done_callback=lambda task: self.fail('done_callback'),
+            )
+        fd = signal.set_wakeup_fd(-1)
+        if fd != -1:
+            signal.set_wakeup_fd(fd)
+        self.assertEqual(fd, wsock.fileno())
+
+    def test_async_fn_changes_guest_state(self):
+        # What async_fn(*args) changes in the guest's thread state is kept
+        # for the batches, and not seen by the host.
+        host = MockHost()
+
+        async def coro():
+            return sys.get_coroutine_origin_tracking_depth()
+
+        def async_fn():
+            sys.set_coroutine_origin_tracking_depth(7)
+            return coro()
+
+        old_depth = sys.get_coroutine_origin_tracking_depth()
+        start_guest_run(
+            async_fn,
+            run_sync_soon_threadsafe=host.run_sync_soon_threadsafe,
+            done_callback=host.done_callback,
+        )
+        self.assertEqual(sys.get_coroutine_origin_tracking_depth(), old_depth)
+        task = host.run()
+        self.assertEqual(task.result(), 7)
+        self.assertEqual(sys.get_coroutine_origin_tracking_depth(), old_depth)
+
+    def test_check_under_asyncio_host(self):
+        # With an asyncio host, host code runs with the host's loop as the
+        # running loop, rather than none: it is still host code.
+        errors = []
+
+        async def main():
+            host_loop = asyncio.get_running_loop()
+            done = host_loop.create_future()
+
+            def host_code():
+                self.assertIs(asyncio.get_running_loop(), host_loop)
+                loop = task.get_loop()
+                try:
+                    loop.call_soon(lambda: None)
+                except RuntimeError as exc:
+                    errors.append(exc)
+                loop.call_soon_threadsafe(task.cancel)
+
+            async def guest():
+                host_loop.call_soon_threadsafe(host_code)
+                await asyncio.sleep(3600)
+
+            with debug_mode(True):
+                task = start_guest_run(
+                    guest,
+                    run_sync_soon_threadsafe=host_loop.call_soon_threadsafe,
+                    done_callback=done.set_result,
+                )
+            await asyncio.wait_for(done, 5)
+            return task
+
+        self.assertTrue(asyncio.run(main()).cancelled())
+        self.assertEqual(len(errors), 1)
+        [error] = errors
+        self.assertIn('from host code', str(error))
+
+    def test_set_debug_during_run(self):
+        # Turned on by guest code, debug mode applies to host code in the
+        # batches that follow.
+        host = MockHost()
+        errors = []
+
+        def host_code():
+            loop = task.get_loop()
+            try:
+                loop.call_soon(lambda: None)
+            except RuntimeError as exc:
+                errors.append(exc)
+            loop.call_soon_threadsafe(task.cancel)
+
+        async def coro():
+            asyncio.get_running_loop().set_debug(True)
+            host.run_sync_soon_threadsafe(host_code)
+            await asyncio.sleep(3600)
+
+        with debug_mode(False):
+            task = start_guest_run(
+                coro,
+                run_sync_soon_threadsafe=host.run_sync_soon_threadsafe,
+                done_callback=host.done_callback,
+            )
+        host.run(timeout=5)
+        self.assertTrue(task.cancelled())
+        [error] = errors
+        self.assertIn('from host code', str(error))
+
+    def test_asyncio_create_task_from_host(self):
+        # Unchanged: there is no running loop between batches.
+        def host_code(loop, task):
+            coro = _call(lambda: None)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'no running'):
+                    asyncio.create_task(coro)
+            finally:
+                coro.close()
+            loop.call_soon_threadsafe(task.cancel)
+
+        for debug in (False, True):
+            with self.subTest(debug=debug):
+                self._run_with_host_code(host_code, debug=debug)
+
+    def test_call_soon_threadsafe_from_host(self):
+        # Works, and wakes the I/O thread's wait right away: nothing else
+        # would, as the main task waits for nothing else.
+        host = MockHost()
+        started = []
+
+        async def set_result(fut):
+            fut.set_result('host')
+
+        def host_code():
+            loop = task.get_loop()
+            started.append(time.monotonic())
+            loop.call_soon_threadsafe(loop.create_task, set_result(fut))
+
+        async def coro():
+            nonlocal fut
+            fut = asyncio.get_running_loop().create_future()
+            host.run_sync_soon_threadsafe(host_code)
+            result = await fut
+            return result, time.monotonic() - started[0]
+
+        fut = None
+        with debug_mode(True):
+            task = start_guest_run(
+                coro,
+                run_sync_soon_threadsafe=host.run_sync_soon_threadsafe,
+                done_callback=host.done_callback,
+            )
+        host.run(timeout=30)
+        result, elapsed = task.result()
+        self.assertEqual(result, 'host')
+        # Without the wake-up the task would wait forever: the bound only
+        # leaves room for a loaded machine.
+        self.assertLess(elapsed, 10)
+
+    def test_host_calls_without_debug(self):
+        # Outside debug mode nothing changes: the calls are accepted, and
+        # their work runs when something wakes the loop.
+        for name, call in HOST_CALLS.items():
+            with self.subTest(name):
+                ran = []
+
+                def host_code(loop, task):
+                    call(loop, lambda: ran.append(True))
+                    loop.call_soon_threadsafe(cancel_when_ran, loop, task)
+
+                def cancel_when_ran(loop, task):
+                    if ran:
+                        task.cancel()
+                    else:
+                        loop.call_soon(cancel_when_ran, loop, task)
+
+                self._run_with_host_code(host_code, debug=False)
+                self.assertEqual(ran, [True])
+
+    def test_guest_calls_unaffected(self):
+        async def coro():
+            loop = asyncio.get_running_loop()
+            self.assertTrue(loop.get_debug())
+            futs = []
+            for call in HOST_CALLS.values():
+                fut = loop.create_future()
+                futs.append(fut)
+                call(loop, partial(fut.set_result, None))
+            await asyncio.gather(*futs)
+            await asyncio.create_task(asyncio.sleep(0.01))
+            return len(futs)
+
+        with debug_mode(True):
+            task = self._run_guest(coro)
+        self.assertEqual(task.result(), len(HOST_CALLS))
+
+    def test_other_thread_still_checked(self):
+        # Calls from another thread fail as on any loop in debug mode.
+        errors = []
+
+        async def coro():
+            loop = asyncio.get_running_loop()
+            thread = threading.Thread(target=call_from_thread, args=[loop])
+            thread.start()
+            await asyncio.sleep(0.01)
+            thread.join()
+
+        def call_from_thread(loop):
+            try:
+                loop.call_soon(lambda: None)
+            except RuntimeError as exc:
+                errors.append(exc)
+
+        with debug_mode(True):
+            self.assertIsNone(self._run_guest(coro).result())
+        [error] = errors
+        self.assertIn('other than the current one', str(error))
+
+    # -- the run's own calls, in debug mode ----------------------------
+
+    def test_completion(self):
+        async def background():
+            await asyncio.sleep(3600)
+
+        async def agen():
+            try:
+                yield 1
+            finally:
+                await asyncio.sleep(0)
+
+        async def coro():
+            asyncio.create_task(background())
+            it = agen()
+            holder.append(it)
+            await anext(it)
+            await asyncio.sleep(0.01)
+            return 'done'
+
+        holder = []
+        with debug_mode(True), self.assertNoLogs('asyncio', level='ERROR'):
+            task = self._run_guest(coro)
+        self.assertEqual(task.result(), 'done')
+
+    def test_exception(self):
+        async def coro():
+            await asyncio.sleep(0)
+            raise ValueError('boom')
+
+        with debug_mode(True):
+            task = self._run_guest(coro)
+        with self.assertRaisesRegex(ValueError, 'boom'):
+            task.result()
+
+    def test_cancel_from_host(self):
+        def host_code(loop, task):
+            loop.call_soon_threadsafe(task.cancel)
+
+        self._run_with_host_code(host_code, debug=True)
+
+    def test_failure_at_start(self):
+        class HostGone(Exception):
+            pass
+
+        def run_sync_soon_threadsafe(fn):
+            raise HostGone
+
+        with debug_mode(True):
+            self._check_unstarted_run_unwound(
+                run_sync_soon_threadsafe, HostGone)
+
+    def test_refused_at_interpreter_shutdown(self):
+        with debug_mode(True), \
+             mock.patch.object(_guest, '_ensure_atexit'), \
+             mock.patch.object(_guest, '_shutting_down', True):
+            self._check_unstarted_run_unwound(
+                lambda fn: self.fail('posted at shutdown'),
+                RuntimeError)
 
 
 if __name__ == '__main__':

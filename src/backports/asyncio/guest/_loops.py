@@ -79,6 +79,26 @@ class _GuestLoopMixin:
                 sys.set_asyncgen_hooks(*self._old_agen_hooks)
                 self._old_agen_hooks = None
 
+    # Whether a batch of guest code is running: set by start_guest_run().
+    _guest_code_running = False
+
+    def _check_thread(self):
+        # Debug mode only, like the method it extends.  A guest loop runs
+        # for the whole guest run, but its own code runs only in batches,
+        # or while it is the thread's running loop, at start and in the
+        # final cleanup.  At other times, on the loop's own thread, the
+        # caller is host code, between batches: nothing would wake the I/O
+        # thread's wait for the work it schedules.  (Guest code of another
+        # guest run that this loop hosts runs inside its batches.)
+        super()._check_thread()
+        if (self._thread_id is not None
+                and not self._guest_code_running
+                and events._get_running_loop() is not self):
+            raise RuntimeError(
+                "Non-thread-safe operation invoked on an asyncio guest loop "
+                "from host code, between its batches: use "
+                "loop.call_soon_threadsafe()")
+
     def _poll_timeout(self):
         """Return the timeout for the next poll, after removing cancelled
         timers: 0 if callbacks are ready, None if nothing is scheduled."""
