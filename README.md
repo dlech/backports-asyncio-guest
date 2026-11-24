@@ -57,8 +57,12 @@ task = start_guest_run(
   - Qt: use a queued connection, not a direct, automatic or blocking one.
 
   If it raises when `start_guest_run()` first calls it, without having run
-  `fn`, the run is cleaned up (the main task, and any other task `async_fn`
-  created, cancelled, and the loop closed) and the exception propagates.
+  `fn`, the run is cleaned up (its tasks cancelled and awaited, and the loop
+  closed) and the exception propagates.
+  With an eager task factory on the loop, e.g. set by the async function,
+  tasks created at start, the main task included, run their first step inside
+  `start_guest_run()`, so the cancelled tasks' cleanup runs there too, and
+  must not wait for the host.
 - `done_callback(task)` runs on the host thread after the run has finished:
   remaining tasks cancelled, async generators and the default executor shut
   down, and the loop closed.
@@ -79,7 +83,7 @@ task = start_guest_run(
   `call_later()`, `call_at()` or `create_task()` between batches, as asyncio
   does for calls from another thread. (Where `asyncio.start_guest_run()` comes
   from the standard library, that depends on its implementation.) Like
-  asyncio's own check, it reports the mistake rather than repair it, so the
+  asyncio's own check, it reports the mistake rather than repairing it, so the
   operation may be left half done: `fut.set_result()` from host code marks the
   future done before `call_soon()` raises, so its awaiter never wakes, and an
   unclosed `StreamWriter` collected between batches reports "Exception
@@ -88,11 +92,15 @@ task = start_guest_run(
   leaves it pending, so "Task was destroyed but it is pending!" is logged too.
   The check can't see calls that don't schedule through those methods, such as
   `loop.stop()`, `handle.cancel()`, `fut.add_done_callback()` on a pending
-  future, and on POSIX `add_reader()` and `remove_reader()`. With an eager
-  task factory, `loop.create_task()` runs the coroutine's first step at once,
-  which the check doesn't catch on Python 3.12 and 3.13, while from 3.14
-  asyncio raises its own "is not the running loop" error. Host code still uses
-  `call_soon_threadsafe()` for all of them.
+  future, and with a selector event loop `add_reader()` and
+  `remove_reader()`. With an eager task factory, `loop.create_task()` runs the
+  task's first step at once, as host code, which the check catches only if the
+  step schedules work through the loop: the task then fails with
+  `RuntimeError`, or if the step yields, `create_task()` raises it, as
+  `SystemError` on Python 3.12 and 3.13 with the C Task implementation (the
+  default). From 3.14, the C Task raises its own "is not the running loop"
+  error before the step. Host code still
+  uses `call_soon_threadsafe()` for all of them.
 - Signal handling stays with the host: `loop.add_signal_handler()` raises
   `RuntimeError`.
 

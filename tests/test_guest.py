@@ -2,6 +2,7 @@
 
 import asyncio
 import gc
+import logging
 import subprocess
 import queue
 import signal
@@ -1273,6 +1274,93 @@ class TestDebugHostCheck(GuestTestCase):
 
         self._check_start_fails_before_main_task(Boom, async_fn=async_fn)
 
+    def _check_tasks_cancelled_before_main_task(self, exc_type, async_fn,
+                                                 started, logged=()):
+        # The run fails before it has a main task, after guest code made
+        # a task: it is cancelled before its coroutine runs, so it isn't
+        # left pending.  Only the messages in logged are logged.
+        loops = []
+        new_guest_loop = _loops.new_guest_loop
+
+        def capture_loop():
+            loops.append(new_guest_loop())
+            return loops[-1]
+
+        for debug in (False, True):
+            with self.subTest(debug=debug):
+                started.clear()
+                loops.clear()
+                hooks = sys.get_asyncgen_hooks()
+                with debug_mode(debug), \
+                     mock.patch.object(_loops, 'new_guest_loop',
+                                       capture_loop), \
+                     self.assertLogs('asyncio', level='ERROR') as cm:
+                    with self.assertRaises(exc_type):
+                        start_guest_run(
+                            async_fn,
+                            run_sync_soon_threadsafe=(
+                                lambda fn: self.fail('posted')),
+                            done_callback=(
+                                lambda task: self.fail('done_callback')),
+                        )
+                    gc.collect()
+                    # assertLogs() needs a record.
+                    logging.getLogger('asyncio').error('end')
+                self.assertEqual(
+                    [record.getMessage().splitlines()[0]
+                     for record in cm.records],
+                    [*logged, 'end'])
+                self.assertEqual(started, [])
+                [loop] = loops
+                self.assertTrue(loop.is_closed())
+                self.assertIsNone(asyncio._get_running_loop())
+                self.assertEqual(sys.get_asyncgen_hooks(), hooks)
+
+    def test_async_fn_raises_after_creating_task(self):
+        class Boom(Exception):
+            pass
+
+        started = []
+
+        async def side():
+            started.append('side')
+
+        def async_fn():
+            asyncio.get_running_loop().create_task(side())
+            raise Boom
+
+        self._check_tasks_cancelled_before_main_task(Boom, async_fn, started)
+
+    @unittest.skipUnless(hasattr(asyncio, 'eager_task_factory'),
+                         'requires eager tasks')
+    def test_eager_main_task_interrupted(self):
+        # The main task's first step raises KeyboardInterrupt, which
+        # create_task() propagates, so there is no main task, after the
+        # step made a task.
+        started = []
+
+        async def side():
+            started.append('side')
+
+        async def main():
+            asyncio.get_running_loop().create_task(side())
+            raise KeyboardInterrupt
+
+        def eager_once(loop, coro, **kwargs):
+            # Only the main task is eager: side() must not run at once.
+            loop.set_task_factory(None)
+            return asyncio.Task(coro, loop=loop, eager_start=True, **kwargs)
+
+        def async_fn():
+            asyncio.get_running_loop().set_task_factory(eager_once)
+            return main()
+
+        # The main task holds the KeyboardInterrupt, which nothing
+        # retrieves, as when a task's step raises one under asyncio.run().
+        self._check_tasks_cancelled_before_main_task(
+            KeyboardInterrupt, async_fn, started,
+            logged=['Task exception was never retrieved'])
+
     def test_async_fn_raises_under_asyncio_host(self):
         class Boom(Exception):
             pass
@@ -1543,6 +1631,44 @@ class TestDebugHostCheck(GuestTestCase):
             signal.set_wakeup_fd(fd)
         self.assertEqual(fd, wsock.fileno())
 
+    @unittest.skipUnless(hasattr(signal, 'set_wakeup_fd'),
+                         'requires signal.set_wakeup_fd')
+    def test_wakeup_fd_restored_when_restore_interrupted(self):
+        # An interrupt in the restore of the host's wakeup fd, once the
+        # loop exists, which may have installed its own: the unwind
+        # restores the host's, and the interrupt propagates.
+        if threading.current_thread() is not threading.main_thread():
+            self.skipTest('requires the main thread')
+        rsock, wsock = socket.socketpair()
+        self.addCleanup(rsock.close)
+        self.addCleanup(wsock.close)
+        wsock.setblocking(False)
+        old_fd = signal.set_wakeup_fd(wsock.fileno())
+        self.addCleanup(signal.set_wakeup_fd, old_fd)
+
+        restore_wakeup_fd = _guest._restore_wakeup_fd
+        interrupted = []
+
+        def interrupted_restore_wakeup_fd(fd):
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            restore_wakeup_fd(fd)
+
+        with mock.patch.object(_guest, '_restore_wakeup_fd',
+                               interrupted_restore_wakeup_fd), \
+             self.assertRaises(KeyboardInterrupt):
+            start_guest_run(
+                asyncio.sleep, 0,
+                run_sync_soon_threadsafe=lambda fn: self.fail('posted'),
+                done_callback=lambda task: self.fail('done_callback'),
+            )
+        self.assertEqual(interrupted, [True])
+        fd = signal.set_wakeup_fd(-1)
+        if fd != -1:
+            signal.set_wakeup_fd(fd)
+        self.assertEqual(fd, wsock.fileno())
+
     def test_async_fn_changes_guest_state(self):
         # What async_fn(*args) changes in the guest's thread state is kept
         # for the batches, and not seen by the host.
@@ -1565,6 +1691,41 @@ class TestDebugHostCheck(GuestTestCase):
         task = host.run()
         self.assertEqual(task.result(), 7)
         self.assertEqual(sys.get_coroutine_origin_tracking_depth(), old_depth)
+
+    def test_guest_code_calls_asyncio_host_loop(self):
+        # Guest code may call the non-thread-safe methods of an asyncio
+        # host's loop in debug mode: only a loop in guest mode checks for
+        # host code.  That includes a host loop of this package's class,
+        # used as an ordinary loop, while the guest's loop is the running
+        # loop.
+        async def main():
+            host_loop = asyncio.get_running_loop()
+            self.assertTrue(host_loop.get_debug())
+            done = host_loop.create_future()
+            called = host_loop.create_future()
+
+            async def guest():
+                host_loop.call_soon(called.set_result, 'called')
+
+            start_guest_run(
+                guest,
+                run_sync_soon_threadsafe=host_loop.call_soon_threadsafe,
+                done_callback=done.set_result,
+            )
+            task = await asyncio.wait_for(done, 5)
+            return task.result(), await called
+
+        for name in ('asyncio', 'guest class'):
+            with self.subTest(name), debug_mode(True):
+                if name == 'asyncio':
+                    result = asyncio.run(main())
+                else:
+                    loop = _loops.new_guest_loop()
+                    try:
+                        result = loop.run_until_complete(main())
+                    finally:
+                        loop.close()
+                self.assertEqual(result, (None, 'called'))
 
     def test_check_under_asyncio_host(self):
         # With an asyncio host, host code runs with the host's loop as the

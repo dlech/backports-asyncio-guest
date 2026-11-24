@@ -195,9 +195,8 @@ def start_guest_run(async_fn, *args,
     the callable, but then the run, and the interpreter's exit, hang if
     the host loop stops while it waits.  It need not preserve ordering.
     If it raises when start_guest_run() first calls it, without having
-    run the callable, the main task, and any other task async_fn(*args)
-    created, are cancelled, the loop is closed, and the exception
-    propagates.
+    run the callable, the run's tasks are cancelled and awaited, the
+    loop is closed, and the exception propagates.
 
     done_callback is called on the host thread after the run has fully
     finished: remaining tasks cancelled, asynchronous generators and the
@@ -206,12 +205,17 @@ def start_guest_run(async_fn, *args,
     argument.
 
     The guest loop is the thread's running loop, with its async
-    generator hooks installed, only while guest callbacks run; the
+    generator hooks installed, only while guest code runs, such as in
+    batches of callbacks, at start, and in the final cleanup.  The
     host's are restored in between.  So host code keeps its own asyncio
     state, and the host may itself be an asyncio event loop.
-    loop.is_running() is true for the whole run.  async_fn starts
+    loop.is_running() is true for the whole run.  The main task starts
     running in the first callback passed to run_sync_soon_threadsafe,
-    after start_guest_run() has returned.
+    after start_guest_run() has returned, unless the loop has an eager
+    task factory, e.g. set by async_fn(*args), which runs the main
+    task's first step at once.  If the start then fails, the cancelled
+    tasks' cleanup runs inside start_guest_run(), where it must not wait
+    for the host.
 
     Host code that runs between guest batches, such as an event
     handler, schedules guest work with loop.call_soon_threadsafe(), as
@@ -220,9 +224,13 @@ def start_guest_run(async_fn, *args,
     guest code: from host code, nothing wakes the loop for the work they
     schedule.  In debug mode, call_soon(), call_later(), call_at() and
     create_task() raise RuntimeError when host code calls them between
-    batches.  With an eager task factory, create_task() runs the
-    coroutine's first step at once instead, which this doesn't catch,
-    though from Python 3.14 asyncio raises its own RuntimeError.
+    batches.  With an eager task factory, create_task() runs the task's
+    first step at once instead, as host code, which this catches only
+    if the step schedules work through the loop: the task then fails
+    with RuntimeError, or if the step yields, create_task() raises it,
+    as SystemError on Python 3.12 and 3.13 with the C Task
+    implementation (the default).  From Python 3.14, the C Task raises
+    its own RuntimeError before the step.
     asyncio.create_task() is unchanged: the guest loop isn't the running
     loop there, so it raises RuntimeError, or with an asyncio host,
     creates the task on the host's loop.
@@ -514,13 +522,14 @@ def start_guest_run(async_fn, *args,
             backend_thread.join()
 
     def _unwind_unstarted():
-        # The run failed to start: cancel the main task, and any task
-        # async_fn(*args) created, and run the loop until the
-        # cancellations have closed them, so nothing is left pending.
-        # If the host function ran a batch anyway, guest code may be
-        # stuck halfway, and waiting for it could hang, so just close the
-        # loop.  Mark the run finished, so that a _finish() or _abort()
-        # it posted does nothing.
+        # The run failed to start: cancel its tasks, and run the loop
+        # until the cancellations have finished them, as asyncio.run()
+        # does, so nothing is left pending.  Their coroutines haven't run,
+        # unless an eager task factory ran a first step, and then the
+        # task's cleanup runs here.  If the host function ran a batch
+        # anyway, guest code may be stuck halfway, and waiting for it
+        # could hang, so just close the loop.  Mark the run finished, so
+        # that a _finish() or _abort() it posted does nothing.
         nonlocal finished
         finished = True
         _cleanup_running_state()
@@ -536,7 +545,7 @@ def start_guest_run(async_fn, *args,
 
     # Whatever fails, or is interrupted, from here on, unwinds as far as
     # the run got: closes the loop, or cancels the tasks too.
-    loop = main_task = None
+    loop = main_task = host_wakeup_fd = None
     try:
         # Create the loop without letting it capture the signal wakeup
         # fd: on Windows, BaseProactorEventLoop.__init__ installs its
@@ -597,10 +606,22 @@ def start_guest_run(async_fn, *args,
             _unwind_unstarted()
         elif loop is not None:
             try:
-                # Whether or not the setup ran, or ran only partway: the
-                # cleanup only resets what the setup may have set.
+                # Again, in case the start was interrupted before the
+                # host's fd was restored: else _close_loop() would save the
+                # loop's own, close() would close it, and _close_loop()
+                # would then restore the closed fd.
+                _restore_wakeup_fd(host_wakeup_fd)
                 with _host_loop_hidden():
+                    # Whether or not the setup ran, or ran only partway:
+                    # the cleanup only resets what the setup may have set.
                     loop._run_forever_cleanup()
+                    # Cancel any task guest code made before it failed,
+                    # e.g. async_fn(*args), or an eager main task's first
+                    # step, as _unwind_unstarted() does.  As guest code:
+                    # no batch has run, and the loop is now the running
+                    # loop only while this drives it.
+                    loop._guest_code_running = True
+                    runners._cancel_all_tasks(loop)
             finally:
                 _close_loop()
         raise

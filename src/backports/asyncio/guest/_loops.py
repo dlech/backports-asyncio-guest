@@ -79,21 +79,24 @@ class _GuestLoopMixin:
                 sys.set_asyncgen_hooks(*self._old_agen_hooks)
                 self._old_agen_hooks = None
 
-    # Whether a batch of guest code is running: set by start_guest_run().
+    # True while a guest run's own code runs on the loop's thread: set
+    # by start_guest_run() around each batch, the start's guest code, the
+    # processing of a failed poll's events and the unwind of a failed
+    # start, and from the final cleanup on.
     _guest_code_running = False
 
     def _check_thread(self):
-        # Debug mode only, like the method it extends.  A guest loop runs
-        # for the whole guest run, but its own code runs only in batches,
-        # or while it is the thread's running loop, at start and in the
-        # final cleanup.  At other times, on the loop's own thread, the
-        # caller is host code, between batches: nothing would wake the I/O
-        # thread's wait for the work it schedules.  (Guest code of another
-        # guest run that this loop hosts runs inside its batches.)
+        # Debug mode only, like the method it extends.  In guest mode, the
+        # loop runs for the whole guest run, but its own code runs only
+        # while _guest_code_running is set.  At other times, on the loop's
+        # own thread, the caller is host code, between batches: nothing
+        # would wake the I/O thread's wait for the work it schedules.
+        # (Guest code of another guest run that this loop hosts runs
+        # while this loop's own code runs.)
         super()._check_thread()
-        if (self._thread_id is not None
-                and not self._guest_code_running
-                and events._get_running_loop() is not self):
+        if (self._guest_mode
+                and self._thread_id is not None
+                and not self._guest_code_running):
             raise RuntimeError(
                 "Non-thread-safe operation invoked on an asyncio guest loop "
                 "from host code, between its batches: use "
