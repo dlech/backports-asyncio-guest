@@ -119,23 +119,33 @@ def _set_thread_state(state):
 _HAS_SWAP_CURRENT_TASK = hasattr(tasks, '_swap_current_task')
 
 
-def _hide_host_task(host_state):
-    """Clear the host loop's current task, if any, and return it.
+def _save_host():
+    """Return the host's thread state and current task, for
+    _restore_host(), without changing them.
 
-    Must be called while the host loop is the running loop.  From
-    Python 3.14, the C Task implementation keeps the current task per
-    thread, and then guest tasks cannot step while another task is
+    Callers save the host before changing anything, and restore it in a
+    'finally' clause: an exception, such as KeyboardInterrupt, may come
+    at any point in between.
+    """
+    state = _get_thread_state()
+    host_loop = state[0]
+    if host_loop is None or not _HAS_SWAP_CURRENT_TASK:
+        return state, None
+    return state, tasks.current_task(host_loop)
+
+
+def _hide_host_task(host):
+    """Clear the host loop's current task, if any.
+
+    From Python 3.14, the C Task implementation keeps the current task
+    per thread, and then guest tasks cannot step while another task is
     current, as one is when guest work runs from a host task, e.g. when
     start_guest_run() is called from one, or the host runs posted
     callables from one.
     """
-    host_loop = host_state[0]
-    if host_loop is None or not _HAS_SWAP_CURRENT_TASK:
-        return None
-    host_task = tasks.current_task(host_loop)
+    host_state, host_task = host
     if host_task is not None:
-        tasks._swap_current_task(host_loop, None)
-    return host_task
+        tasks._swap_current_task(host_state[0], None)
 
 
 def _restore_host(host_state, host_task):
@@ -154,13 +164,13 @@ def _host_loop_hidden():
     asyncio host is suspended in one of its callbacks at that point, so
     the two loops never actually run nested.
     """
-    state = _get_thread_state()
-    host_task = _hide_host_task(state)
-    events._set_running_loop(None)
+    host = _save_host()
     try:
+        _hide_host_task(host)
+        events._set_running_loop(None)
         yield
     finally:
-        _restore_host(state, host_task)
+        _restore_host(*host)
 
 
 def start_guest_run(async_fn, *args,
@@ -228,19 +238,6 @@ def start_guest_run(async_fn, *args,
     """
     _ensure_atexit()
 
-    # Create the loop without letting it capture the signal wakeup fd:
-    # on Windows, BaseProactorEventLoop.__init__ installs its self-pipe
-    # as the wakeup fd when on the main thread, which would silently
-    # break the host's signal handling.
-    host_wakeup_fd = _save_wakeup_fd()
-    loop = _loops.new_guest_loop()
-    _restore_wakeup_fd(host_wakeup_fd)
-
-    # The host owns signal handling (see the docstring).  Never reset:
-    # 'finally' blocks of tasks cancelled during the final cleanup must
-    # not be able to install signal handlers either.
-    loop._guest_mode = True
-
     def _close_loop():
         # BaseProactorEventLoop.close() resets the wakeup fd to -1 on
         # the main thread; preserve the host's fd across it.
@@ -259,38 +256,21 @@ def start_guest_run(async_fn, *args,
     finished = False
     cleaned_up = False
     batch_ran = False
-
-    # Mark the loop as running for the whole guest run.  On Windows this
-    # also starts the proactor's self-reading loop, so that
-    # call_soon_threadsafe() can wake the I/O thread's poll.  The
-    # per-thread part of the setup is captured as guest_state and
-    # swapped in only around guest callbacks (see _enter_guest()).
-    with _host_loop_hidden():
-        try:
-            loop._run_forever_setup()
-        except BaseException:
-            _close_loop()
-            raise
-        try:
-            main_task = loop.create_task(async_fn(*args))
-        except BaseException:
-            loop._run_forever_cleanup()
-            _close_loop()
-            raise
-        guest_state = _get_thread_state()
+    backend_thread = None
 
     # -- helpers (host thread unless noted) ----------------------------
 
-    def _enter_guest():
-        # Install the guest's per-thread state, with no current task;
-        # return the host's.
-        host_state = _get_thread_state()
-        host_task = _hide_host_task(host_state)
+    def _enter_guest(host):
+        # Install the guest's per-thread state, with no current task.
+        # host is from _save_host(), called before, and _leave_guest(host)
+        # must follow in a 'finally' clause, even if this is interrupted.
+        _hide_host_task(host)
         _set_thread_state(guest_state)
-        return host_state, host_task
 
     def _leave_guest(host):
         # Keep changes made by guest callbacks, e.g. by loop.set_debug().
+        # If entering was interrupted, what is kept may be the host's
+        # state, but then the batch raises, and the run is abandoned.
         nonlocal guest_state
         guest_state = _get_thread_state()
         _restore_host(*host)
@@ -300,8 +280,9 @@ def start_guest_run(async_fn, *args,
         if cleaned_up:
             return
         cleaned_up = True
-        host = _enter_guest()
+        host = _save_host()
         try:
+            _enter_guest(host)
             loop._run_forever_cleanup()
         finally:
             _restore_host(*host)
@@ -316,7 +297,7 @@ def start_guest_run(async_fn, *args,
             loop._write_to_self()
         except Exception:
             pass
-        if backend_thread.ident is not None:
+        if backend_thread is not None and backend_thread.ident is not None:
             backend_thread.join()
 
     def _deliver(task, *, graceful):
@@ -365,8 +346,9 @@ def start_guest_run(async_fn, *args,
             # The failed poll took these events before failing: process
             # them, or their futures would never complete, and closing the
             # loop would wait for them.
-            host = _enter_guest()
+            host = _save_host()
             try:
+                _enter_guest(host)
                 loop.process_events(event_list)
             except Exception as e:
                 loop.call_exception_handler({
@@ -401,8 +383,18 @@ def start_guest_run(async_fn, *args,
         if shutdown.is_set() or loop.is_closed():
             return
         batch_ran = True
-        host = _enter_guest()
+        # _save_host() and _enter_guest(), inlined: this runs per batch.
+        host_state = (events._get_running_loop(), sys.get_asyncgen_hooks(),
+                      sys.get_coroutine_origin_tracking_depth())
+        host_loop = host_state[0]
+        if host_loop is not None and _HAS_SWAP_CURRENT_TASK:
+            host = host_state, tasks.current_task(host_loop)
+        else:
+            host = host_state, None
         try:
+            if host[1] is not None:
+                tasks._swap_current_task(host_loop, None)
+            _set_thread_state(guest_state)
             loop.process_events(event_list)
             event_list = None
             loop.process_ready()
@@ -442,6 +434,11 @@ def start_guest_run(async_fn, *args,
         wakeup.release()
 
     def _on_task_done(task):
+        if finished:
+            # The run failed to start, or is being cleaned up: e.g. an
+            # eager main task finished at start, and the unwind ran the
+            # callback it had queued.
+            return
         # Runs inside process_ready() while the host holds the token,
         # so the I/O thread is parked in wakeup.acquire(): the released
         # token wakes it, it observes 'shutdown', and exits without
@@ -523,21 +520,51 @@ def start_guest_run(async_fn, *args,
 
     # -- start ---------------------------------------------------------
 
-    main_task.add_done_callback(_on_task_done)
-
-    backend_thread = threading.Thread(
-        target=_backend, name='asyncio-guest-io')
-
-    with _lock:
-        shutting_down = _shutting_down
-        if not shutting_down:
-            _stoppers.add(_stop_at_exit)
-    if shutting_down:
-        _unwind_unstarted()
-        raise RuntimeError(
-            'cannot start an asyncio guest run at interpreter shutdown')
-
+    # Whatever fails, or is interrupted, from here on, unwinds as far as
+    # the run got: closes the loop, or cancels the tasks too.
+    loop = main_task = None
     try:
+        # Create the loop without letting it capture the signal wakeup
+        # fd: on Windows, BaseProactorEventLoop.__init__ installs its
+        # self-pipe as the wakeup fd when on the main thread, which would
+        # silently break the host's signal handling.
+        host_wakeup_fd = _save_wakeup_fd()
+        try:
+            loop = _loops.new_guest_loop()
+        finally:
+            _restore_wakeup_fd(host_wakeup_fd)
+
+        # The host owns signal handling (see the docstring).  Never reset:
+        # 'finally' blocks of tasks cancelled during the final cleanup
+        # must not be able to install signal handlers either.
+        loop._guest_mode = True
+
+        # Mark the loop as running for the whole guest run.  On Windows
+        # this also starts the proactor's self-reading loop, so that
+        # call_soon_threadsafe() can wake the I/O thread's poll.  The
+        # per-thread part of the setup is captured as guest_state and
+        # swapped in only around guest callbacks (see _enter_guest()).
+        with _host_loop_hidden():
+            loop._run_forever_setup()
+            guest_state = _get_thread_state()
+            # With an eager task factory, the main task's first step runs
+            # here.  If that finishes the task, adding the done callback
+            # schedules it with call_soon().
+            main_task = loop.create_task(async_fn(*args))
+            main_task.add_done_callback(_on_task_done)
+            # Again: async_fn(*args) may have changed it.
+            guest_state = _get_thread_state()
+
+        backend_thread = threading.Thread(
+            target=_backend, name='asyncio-guest-io')
+
+        with _lock:
+            if _shutting_down:
+                raise RuntimeError(
+                    'cannot start an asyncio guest run at interpreter '
+                    'shutdown')
+            _stoppers.add(_stop_at_exit)
+
         # The I/O thread waits for the token, which the host holds until
         # the first batch has run.  That batch is scheduled rather than
         # run inline: with an asyncio host the caller is usually a host
@@ -545,10 +572,19 @@ def start_guest_run(async_fn, *args,
         backend_thread.start()
         run_sync_soon_threadsafe(partial(_process_on_host, []))
     except BaseException:
-        with _lock:
-            _stoppers.discard(_stop_at_exit)
-        _join_backend()
-        _unwind_unstarted()
+        if main_task is not None:
+            with _lock:
+                _stoppers.discard(_stop_at_exit)
+            _join_backend()
+            _unwind_unstarted()
+        elif loop is not None:
+            try:
+                # Whether or not the setup ran, or ran only partway: the
+                # cleanup only resets what the setup may have set.
+                with _host_loop_hidden():
+                    loop._run_forever_cleanup()
+            finally:
+                _close_loop()
         raise
 
     return main_task
